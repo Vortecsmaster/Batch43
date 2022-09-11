@@ -13,7 +13,7 @@
 {-# OPTIONS_GHC -fno-warn-unused-imports #-}
 {-# LANGUAGE NumericUnderscores #-}
 
-module Batch43MathBounty where
+module Batch43NFTBounty where
 
 import           Control.Monad             (void)
 import Data.Default               (Default (..))
@@ -28,6 +28,7 @@ import           Ledger
 import qualified Ledger.Constraints        as Constraints
 import qualified Ledger.Typed.Scripts      as Scripts  --Ledger.V1.Utils Ledger.V3.Utils
 import           Ledger.Ada                as Ada
+import           Ledger.Value              as Value
 import           Playground.Contract
 import qualified Prelude
 import Prelude (IO, Show, String, show, Semigroup (..))
@@ -79,6 +80,33 @@ bountyAddress = scriptAddress validator
 
 -- Equivalent to Cardano-CLI cardano-cli address build --payment-script-file <JSON encoded CBORhex of script> $TESTNET --out-file <some output file>
 
+{-# INLINABLE nftMintingPolicy  #-}
+nftMintingPolicy :: TxOutRef -> TokenName ->  () -> ScriptContext -> Bool
+nftMintingPolicy oref tname _ sContext = traceIfFalse "UTxO not consumed" hasUTxO               &&
+                                         traceIfFalse "Wrong ammount minted" checkMintedAmount 
+    where
+      info :: TxInfo
+      info = scriptContextTxInfo sContext
+
+      hasUTxO :: Bool
+      hasUTxO = any (\utxo -> txInInfoOutRef utxo == oref) $ txInfoInputs info
+
+      checkMintedAmount :: Bool
+      checkMintedAmount = case flattenValue (txInfoMint info) of
+        [(_, tname', amount)]   ->  tname' == tname && amount == 1
+        _                       ->  False
+
+policy :: TxOutRef -> TokenName -> Scripts.MintingPolicy
+policy oref tname = mkMintingPolicyScript $
+             $$(PlutusTx.compile [|| \oref' tname' -> Scripts.wrapMintingPolicy $ nftMintingPolicy oref' tname' ||])
+             `PlutusTx.applyCode`
+             PlutusTx.liftCode oref
+             `PlutusTx.applyCode`
+             PlutusTx.liftCode tname
+
+curSymbol :: TxOutRef -> TokenName -> CurrencySymbol
+curSymbol oref tname = scriptCurrencySymbol $ policy oref tname
+
 --OFF-CHAIN
 
 data BountyParams = BP
@@ -101,7 +129,6 @@ bounty (BP input amount deadline) = do
                                   void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
                                   logInfo @String $ printf "Bounty created of amount = %s" (show amount)
 
-
 solution :: Integer -> Contract () MathBountySchema Text ()
 solution guess = do
                  now <- currentTime
@@ -110,10 +137,14 @@ solution guess = do
                  case Map.toList utxos of
                     []                 -> logInfo @String $ printf "No UTxOs on the Contract!"
                     (oref,a):xs        -> do
+                                          let tname = TokenName "Batch43BountyWinner"
+                                          let val = Value.singleton (curSymbol oref tname) tname 1
                                           let lookups = Constraints.otherScript validator  <>
-                                                        Constraints.unspentOutputs (Map.fromList [(oref,a)])
+                                                        Constraints.unspentOutputs (Map.fromList [(oref,a)]) <>
+                                                        Constraints.mintingPolicy (policy oref tname)
                                               tx      = Constraints.mustSpendScriptOutput oref (Redeemer $ toBuiltinData guess) <>
-                                                        Constraints.mustValidateIn (to now) -- include all posible UTxOs (mconcat [mustSpendScriptOutput oref $ Redeemer $ Builtins.mkI n | oref <- orefs] )
+                                                        Constraints.mustValidateIn (to now) <>
+                                                        Constraints.mustMintValue val
                                           ledgerTx <- submitTxConstraintsWith @Void lookups tx
                                           void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
                                           logInfo @String $ printf "Proposed solution was: %s " (show guess)
